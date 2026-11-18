@@ -1,6 +1,8 @@
 //! Orbit/fly camera and the small amount of linear algebra it needs.
 //! Matrices are column-major, matching GLSL and Makepad's `Mat4`.
 
+use crate::layout::Rect;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct V3 {
     pub x: f32,
@@ -85,9 +87,25 @@ pub struct View {
     /// Pixels per world unit at distance 1 along the view axis.
     pub focal_px: f32,
     pub size: (f32, f32),
+    pub map_bounds: Option<Rect>,
 }
 
 impl Camera {
+    pub fn fit_map(rect: Rect, width: f32, height: f32) -> Self {
+        let (x, z) = rect.center();
+        let units = (rect.w / width.max(1.0)).max(rect.h / height.max(1.0)) * 1.14;
+        Self::map_at(x, z, units, height)
+    }
+
+    pub fn map_at(x: f32, z: f32, units_per_px: f32, height: f32) -> Self {
+        Self {
+            target: v3(x, 0.0, z),
+            dist: units_per_px * height.max(1.0) / (2.0 * (FOV_Y * 0.5).tan()),
+            yaw: 0.0,
+            pitch: std::f32::consts::FRAC_PI_2,
+        }
+    }
+
     pub fn eye(&self) -> V3 {
         let (cp, sp) = (self.pitch.cos(), self.pitch.sin());
         self.target
@@ -135,6 +153,37 @@ impl Camera {
             view_proj: mul(&proj, &view),
             focal_px: height * 0.5 * t,
             size: (width, height),
+            map_bounds: None,
+        }
+    }
+
+    /// Axis-aligned map with a uniform scale and +z pointing down the screen.
+    pub fn map_view(&self, width: f32, height: f32) -> View {
+        let units = self.units_per_px(height);
+        let (w, h) = (width * units, height * units);
+        let bounds = Rect {
+            x: self.target.x - w * 0.5,
+            z: self.target.z - h * 0.5,
+            w,
+            h,
+        };
+        let (sx, sz) = (2.0 / w, 2.0 / h);
+        #[rustfmt::skip]
+        let view_proj = [
+            sx, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            0.0, -sz, 0.0, 0.0,
+            -self.target.x * sx, self.target.z * sz, 0.5, 1.0,
+        ];
+        View {
+            eye: self.target,
+            forward: v3(0.0, -1.0, 0.0),
+            right: v3(1.0, 0.0, 0.0),
+            up: v3(0.0, 0.0, -1.0),
+            view_proj,
+            focal_px: 1.0 / units,
+            size: (width, height),
+            map_bounds: Some(bounds),
         }
     }
 
@@ -174,6 +223,13 @@ impl View {
 
     /// Intersection of the ray through a screen point with the plane `y`.
     pub fn hit_plane(&self, px: f32, py: f32, y: f32) -> Option<V3> {
+        if let Some(bounds) = self.map_bounds {
+            return Some(v3(
+                bounds.x + px / self.focal_px,
+                y,
+                bounds.z + py / self.focal_px,
+            ));
+        }
         let d = self.ray(px, py);
         if d.y.abs() < 1e-6 {
             return None;
@@ -194,5 +250,33 @@ impl View {
             (0.5 - c[1] / c[3] * 0.5) * h,
             c[3],
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_fits_and_picks_in_both_aspect_ratios() {
+        let rect = Rect {
+            x: 30.0,
+            z: -40.0,
+            w: 1500.0,
+            h: 2000.0,
+        };
+        for (w, h) in [(1920.0, 1080.0), (500.0, 1100.0)] {
+            let cam = Camera::fit_map(rect, w, h);
+            let view = cam.map_view(w, h);
+            let bounds = view.map_bounds.unwrap();
+            assert!(bounds.contains(rect.x, rect.z));
+            assert!(bounds.contains(rect.x + rect.w, rect.z + rect.h));
+            let p = v3(180.0, 3.0, 91.0);
+            let (x, y, _) = view.project(p).unwrap();
+            let hit = view.hit_plane(x, y, p.y).unwrap();
+            assert!(hit.sub(p).len() < 0.001);
+            let (_, below, _) = view.project(v3(p.x, p.y + 120.0, p.z + 10.0)).unwrap();
+            assert!(below > y);
+        }
     }
 }

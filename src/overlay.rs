@@ -42,6 +42,7 @@ fn hex(c: u32) -> [f32; 3] {
 pub enum FileState {
     Added,
     Modified,
+    Renamed,
     Deleted,
 }
 
@@ -50,6 +51,7 @@ impl FileState {
         match self {
             FileState::Added => "A",
             FileState::Modified => "M",
+            FileState::Renamed => "R",
             FileState::Deleted => "D",
         }
     }
@@ -57,6 +59,7 @@ impl FileState {
 
 pub struct FileOverlay {
     pub state: FileState,
+    pub rename: Option<(String, String)>,
     pub added: usize,
     pub removed: usize,
     /// One mark per line of the file as it is on disk.

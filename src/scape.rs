@@ -1,9 +1,8 @@
-//! The `CodeScape` widget: renders the repository as a 3D landscape of
-//! directory blocks and text tiles, and handles fly-through navigation.
+//! The `CodeScape` widget renders the repository as directory panels and
+//! source tiles, and handles map navigation.
 //!
-//! Level of detail: every file is always drawn as one quad sampling the
-//! minimap atlas. Files that are large on screen additionally get real SDF
-//! glyph quads, nearest first, up to `GLYPH_BUDGET`.
+//! Visible files are drawn as quads sampling the minimap atlas. Files that
+//! are large on screen also get SDF glyph quads, up to `GLYPH_BUDGET`.
 
 use crate::atlas::{self, Image};
 use crate::camera::{v3, Camera, View, V3};
@@ -13,7 +12,8 @@ use crate::layout::Layout;
 use crate::overlay::{FileState, Overlay};
 use crate::scan::{self, SourceFile};
 use crate::scene::{
-    collect_glyphs, hex, overview, reading_view, syntax_palette, Scene, ACCENTS, GLYPH_SLOTS,
+    collect_glyphs, hex, map_reading_view, overview, reading_view, syntax_palette, Scene, ACCENTS,
+    GLYPH_SLOTS,
 };
 use crate::tour::Tour;
 use crate::trace::Trace;
@@ -92,6 +92,36 @@ script_mod! {
             let shade = side * mix(0.45, 1.0, self.local.y);
             let lip = 1.0 - smoothstep(0.0, max(wpp * 1.5, 0.3), (1.0 - self.local.y) * self.box_size.y);
             return vec4(mix(self.top.rgb * shade, self.rim.rgb * 0.8, lip), 1.0);
+        }
+    }
+
+    mod.draw.DrawMapDir = mod.std.set_type_default() do #(DrawMapDir::script_shader(vm)){
+        alpha_blend: false
+        backface_culling: false
+        vertex_pos: vertex_position(vec4f)
+        fb0: fragment_output(0, vec4f)
+        draw_call: uniform_buffer(draw.DrawCallUniforms)
+        draw_pass: uniform_buffer(draw.DrawPassUniforms)
+        draw_list: uniform_buffer(draw.DrawListUniforms)
+        geom: vertex_buffer(geom.QuadVertex, geom.QuadGeom)
+
+        vp0: uniform(vec4(1.0, 0.0, 0.0, 0.0))
+        vp2: uniform(vec4(0.0, 1.0, 0.0, 0.0))
+        vp3: uniform(vec4(0.0, 0.0, 0.0, 1.0))
+        focal_px: uniform(1.0)
+        local: varying(vec2f)
+
+        vertex: fn() {
+            self.local = self.geom.pos * self.rect.zw;
+            let p = self.rect.xy + self.local;
+            self.vertex_pos = self.vp0 * p.x + self.vp2 * p.y + self.vp3;
+        }
+
+        fragment: fn() {
+            let edges = min(self.local, self.rect.zw - self.local);
+            let rim = max(self.rim.w, 1.5 / self.focal_px);
+            let k = 1.0 - smoothstep(rim * 0.5, rim, min(edges.x, edges.y));
+            self.fb0 = vec4(mix(self.fill.rgb, self.rim.rgb, k), 1.0);
         }
     }
 
@@ -184,11 +214,13 @@ script_mod! {
 
         vertex: fn() {
             let p = vec3(
-                self.gpos.x + self.geom.pos.x * self.gsize.x,
+                self.gpos.x + self.geom.pos.x * (self.height * 0.5),
                 self.gpos.y,
-                self.gpos.z + self.geom.pos.y * self.gsize.y
+                self.gpos.z + self.geom.pos.y * self.height
             );
-            self.tex = (self.cell + self.geom.pos) / vec2(16.0, 6.0);
+            let row = floor(self.cell_index / 16.0);
+            let cell = vec2(self.cell_index - row * 16.0, row);
+            self.tex = (cell + self.geom.pos) / vec2(16.0, 6.0);
             let c = self.clip(p);
             self.cw = c.w;
             self.vertex_pos = vec4(c.x, c.y, c.z - 0.00005 * c.w, c.w);
@@ -199,12 +231,12 @@ script_mod! {
         }
 
         pixel: fn() {
-            let px = self.gsize.y * self.focal_px / self.cw;
+            let px = self.height * self.focal_px / self.cw;
             let d = self.font.sample_as_bgra(self.tex).x;
             // SDF spread: 4 of the 64 texels per cell map onto 0.5 of range.
             let w = clamp(64.0 / max(px, 0.001) * 0.125 * 0.5, 0.02, 0.5);
-            let a = smoothstep(0.5 - w, 0.5 + w, d) * smoothstep(self.fade.x, self.fade.y, px);
-            return vec4(self.color.rgb * a, a);
+            let a = smoothstep(0.5 - w, 0.5 + w, d) * smoothstep(self.fade_start, self.fade_start * 2.0, px);
+            return vec4(self.color * a, a);
         }
     }
 
@@ -215,6 +247,7 @@ script_mod! {
         height: Fill
         font_file: crate_resource("makepad_widgets:resources/LiberationMono-Regular.ttf")
         draw_box: mod.draw.DrawBox{}
+        draw_map_dir: mod.draw.DrawMapDir{}
         draw_tile: mod.draw.DrawTile{}
         draw_glyph: mod.draw.DrawGlyph{}
         draw_scene_texture: mod.draw.DrawSceneTexture{}
@@ -311,6 +344,22 @@ draw_shader_impl!(DrawBox);
 
 #[derive(Script, ScriptHook)]
 #[repr(C)]
+pub struct DrawMapDir {
+    #[rust]
+    pub many_instances: Option<ManyInstances>,
+    #[deref]
+    pub draw_vars: DrawVars,
+    #[live]
+    pub rect: Vec4,
+    #[live]
+    pub fill: Vec4,
+    #[live]
+    pub rim: Vec4,
+}
+draw_shader_impl!(DrawMapDir);
+
+#[derive(Script, ScriptHook)]
+#[repr(C)]
 pub struct DrawTile {
     #[rust]
     pub many_instances: Option<ManyInstances>,
@@ -342,16 +391,51 @@ pub struct DrawGlyph {
     #[live]
     pub gpos: Vec3,
     #[live]
-    pub gsize: Vec2,
+    pub height: f32,
     #[live]
-    pub cell: Vec2,
-    /// Glyph height in pixels over which the glyph fades in.
+    pub cell_index: f32,
+    /// The fade starts at this pixel height and ends at twice that height.
     #[live]
-    pub fade: Vec2,
+    pub fade_start: f32,
     #[live]
-    pub color: Vec4,
+    pub color: Vec3,
 }
 draw_shader_impl!(DrawGlyph);
+
+// The diff stays fixed for the lifetime of the checkout view.
+fn diff_summary(ov: &Overlay, sources: &[SourceFile], touched: usize) -> Option<(String, usize)> {
+    if touched == 0 && ov.deleted.is_empty() {
+        return None;
+    }
+    let (added, removed) = ov.totals();
+    let mut body = format!(
+        "{}\n{} files changed   +{}  -{}",
+        ov.label, touched, added, removed
+    );
+    // Keep source order for files with equal churn.
+    let mut top: Vec<_> = ov
+        .files
+        .iter()
+        .enumerate()
+        .filter_map(|(i, f)| f.as_ref().map(|f| (i, f)))
+        .collect();
+    top.sort_by_key(|(_, f)| std::cmp::Reverse(f.churn()));
+    for (i, f) in top.iter().take(6) {
+        let path = f.rename.as_ref().map(|(old, new)| format!("{old} → {new}"));
+        body.push_str(&format!(
+            "\n{} +{:<5} -{:<5} {}",
+            f.state.tag(),
+            f.added,
+            f.removed,
+            path.as_deref().unwrap_or(&sources[*i].path)
+        ));
+    }
+    for (path, removed) in ov.deleted.iter().take(3) {
+        body.push_str(&format!("\nD       -{:<5} {}", removed, path));
+    }
+    let rows = 2 + top.len().min(6) + ov.deleted.len().min(3);
+    Some((body, rows))
+}
 
 fn rgba(c: [f32; 3], a: f32) -> Vec4 {
     vec4(c[0], c[1], c[2], a)
@@ -376,6 +460,8 @@ pub struct CodeScape {
     area: Area,
     #[live]
     draw_box: DrawBox,
+    #[live]
+    draw_map_dir: DrawMapDir,
     #[live]
     draw_tile: DrawTile,
     #[live]
@@ -443,6 +529,12 @@ pub struct CodeScape {
     pending_capture: Option<PendingCapture>,
     #[rust]
     glyph_buf: Vec<f32>,
+    #[rust]
+    glyph_view: Option<(Camera, (f32, f32))>,
+    #[rust]
+    has_overlay_tiles: bool,
+    #[rust]
+    diff_summary: Option<(String, usize)>,
 }
 
 struct PendingCapture {
@@ -462,6 +554,7 @@ struct Rect2 {
 #[derive(Default)]
 struct Options {
     parsed: bool,
+    perspective: bool,
     repo: Option<PathBuf>,
     tour: bool,
     tour_loop: bool,
@@ -484,35 +577,71 @@ struct Options {
 
 impl Options {
     fn parse() -> Options {
+        Self::parse_args(std::env::args().skip(1))
+    }
+
+    fn parse_args(mut args: impl Iterator<Item = String>) -> Options {
         let mut o = Options {
             parsed: true,
             record_fps: 30.0,
             atlas_size: 8192,
             ..Default::default()
         };
-        let mut args = std::env::args().skip(1);
         while let Some(a) = args.next() {
             match a.as_str() {
+                "--3d" => o.perspective = true,
                 "--tour" => o.tour = true,
                 "--loop" => o.tour_loop = true,
                 "--exit-after-tour" => o.exit_after_tour = true,
-                "--record" => o.record = args.next().map(PathBuf::from),
+                "--record" => {
+                    o.record = Some(
+                        args.next()
+                            .filter(|p| !p.starts_with("--"))
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| {
+                                crate::fail("--record requires an output directory")
+                            }),
+                    );
+                }
                 "--record-fps" => {
-                    o.record_fps = args.next().and_then(|v| v.parse().ok()).unwrap_or(30.0)
+                    o.record_fps = args
+                        .next()
+                        .and_then(|v| v.parse().ok())
+                        .filter(|n: &f64| *n > 0.0 && n.is_finite() && n.recip().is_finite())
+                        .unwrap_or_else(|| {
+                            crate::fail("--record-fps requires a finite positive rate")
+                        });
                 }
                 "--diff" => o.diff = args.next(),
                 "--pr" => o.pr = args.next().and_then(|v| v.parse().ok()),
-                "--trace" => o.trace = args.next().map(PathBuf::from),
+                "--trace" => {
+                    o.trace = Some(
+                        args.next()
+                            .filter(|p| !p.starts_with("--"))
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| crate::fail("--trace requires an ITF file")),
+                    );
+                }
                 "--trace-rate" => {
                     o.trace_rate = args
                         .next()
                         .and_then(|v| v.parse().ok())
-                        .filter(|r: &f64| *r > 0.0)
+                        .filter(|r: &f64| *r > 0.0 && r.is_finite() && r.recip().is_finite())
                 }
-                "--at" => o.at = args.next().and_then(|v| v.parse().ok()),
+                "--at" => {
+                    o.at = Some(
+                        args.next()
+                            .and_then(|v| v.parse().ok())
+                            .filter(|t: &f64| t.is_finite() && *t >= 0.0)
+                            .unwrap_or_else(|| {
+                                crate::fail("--at requires finite nonnegative seconds")
+                            }),
+                    );
+                }
                 "--shot" => o.shot = args.next().map(PathBuf::from),
                 "--atlas" => {
-                    o.atlas_size = args.next().and_then(|v| v.parse().ok()).unwrap_or(8192)
+                    o.atlas_size =
+                        atlas::parse_size(args.next()).unwrap_or_else(|error| crate::fail(error));
                 }
                 s if !s.starts_with('-') => o.repo = Some(PathBuf::from(s)),
                 _ => {}
@@ -525,9 +654,28 @@ impl Options {
         // records the tour.
         if o.record.is_some() && o.trace.is_none() {
             o.tour = true;
+            o.tour_loop = false;
             o.exit_after_tour = true;
         }
         o
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Options;
+
+    #[test]
+    fn tour_recordings_run_once_even_with_loop_enabled() {
+        let args = ["--record", "frames", "--loop"]
+            .into_iter()
+            .map(String::from);
+        let options = Options::parse_args(args);
+        assert!(options.tour && options.exit_after_tour);
+        assert!(!options.tour_loop);
+        let interactive = Options::parse_args(["--tour", "--loop"].into_iter().map(String::from));
+        assert!(interactive.tour && interactive.tour_loop);
+        assert!(!interactive.exit_after_tour);
     }
 }
 
@@ -558,12 +706,13 @@ const CPU_MIP_LEVELS: usize = if cfg!(target_vendor = "apple") {
 
 fn upload(cx: &mut Cx, mut img: Image, mips: bool) -> Texture {
     let format = if mips {
-        atlas::append_mip_levels(&mut img, CPU_MIP_LEVELS);
+        let levels = MIP_LEVELS.min(img.width.max(img.height).ilog2() as usize);
+        atlas::append_mip_levels(&mut img, CPU_MIP_LEVELS.min(levels));
         TextureFormat::VecMipBGRAu8_32 {
             width: img.width,
             height: img.height,
             data: Some(img.data),
-            max_level: Some(MIP_LEVELS),
+            max_level: Some(levels),
             wrap: TextureWrap::ClampToEdge,
             updated: TextureUpdated::Full,
         }
@@ -591,57 +740,53 @@ impl CodeScape {
                 initial: true,
             },
         );
-        self.scene_depth = Texture::new_with_format(
-            cx,
-            TextureFormat::DepthD32 {
-                size: TextureSize::Auto,
-                initial: true,
-            },
-        );
         self.scene_pass.set_color_texture(
             cx,
             &self.scene_color,
             DrawPassClearColor::ClearWith(self.clear_color),
         );
-        self.scene_pass.set_depth_texture(
-            cx,
-            &self.scene_depth,
-            DrawPassClearDepth::ClearWith(1.0),
-        );
+        if self.opts.perspective {
+            self.scene_depth = Texture::new_with_format(
+                cx,
+                TextureFormat::DepthD32 {
+                    size: TextureSize::Auto,
+                    initial: true,
+                },
+            );
+            self.scene_pass.set_depth_texture(
+                cx,
+                &self.scene_depth,
+                DrawPassClearDepth::ClearWith(1.0),
+            );
+        }
     }
 
-    fn queue_capture(&mut self, cx: &mut Cx, path: PathBuf, quit_after: bool) -> bool {
+    fn queue_capture(&mut self, cx: &mut Cx, path: PathBuf, quit_after: bool) {
         if let Some(parent) = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            if let Err(error) = std::fs::create_dir_all(parent) {
-                log!(
-                    "codescape: could not create capture directory {}: {error}",
+            std::fs::create_dir_all(parent).unwrap_or_else(|error| {
+                crate::fail(format_args!(
+                    "could not create capture directory {}: {error}",
                     parent.display()
-                );
-                cx.quit();
-                return false;
-            }
+                ))
+            });
         }
-        match self
+        let ticket = self
             .scene_color
             .read_back(cx, ReadbackRequest { next_render: false })
-        {
-            Ok(ticket) => {
-                self.pending_capture = Some(PendingCapture {
-                    ticket,
-                    path,
-                    quit_after,
-                });
-                true
-            }
-            Err(error) => {
-                log!("codescape: could not capture {}: {error}", path.display());
-                cx.quit();
-                false
-            }
-        }
+            .unwrap_or_else(|error| {
+                crate::fail(format_args!(
+                    "could not capture {}: {error}",
+                    path.display()
+                ))
+            });
+        self.pending_capture = Some(PendingCapture {
+            ticket,
+            path,
+            quit_after,
+        });
     }
 
     fn drain_captures(&mut self, cx: &mut Cx) {
@@ -671,12 +816,10 @@ impl CodeScape {
                     std::fs::write(&pending.path, png).map_err(|error| error.to_string())
                 });
             if let Err(error) = result {
-                log!(
-                    "codescape: could not save {}: {error}",
+                crate::fail(format_args!(
+                    "could not save {}: {error}",
                     pending.path.display()
-                );
-                cx.quit();
-                return;
+                ));
             }
             if pending.quit_after {
                 cx.quit();
@@ -730,8 +873,11 @@ impl CodeScape {
                 .unwrap_or_else(|| "repo".into()),
         };
         let revision = git(&root, &["rev-parse", "--short", "HEAD"]);
-        let sources = scan::scan_repo(&root);
+        let sources = scan::scan_repo(&root).unwrap_or_else(|error| crate::fail(error));
         let overlay = self.build_overlay(&root, &sources);
+        let touched = overlay.touched();
+        self.has_overlay_tiles = touched > 0;
+        self.diff_summary = diff_summary(&overlay, &sources, touched);
         let mut layout = Layout::build(&sources, &repo);
         let palette = syntax_palette();
         let (minimap, texel) = atlas::build_minimap(
@@ -741,7 +887,8 @@ impl CodeScape {
             &overlay,
             self.opts.atlas_size,
             CPU_MIP_LEVELS,
-        );
+        )
+        .unwrap_or_else(|error| crate::fail(error));
         let ttf = self.bundled_font(cx).expect("bundled monospace font");
         let font = atlas::build_font(&ttf);
         let minimap = upload(cx, minimap, true);
@@ -749,7 +896,7 @@ impl CodeScape {
         self.draw_tile.draw_vars.set_texture(0, &minimap);
         self.draw_glyph.draw_vars.set_texture(0, &font);
         let root_rect = layout.dirs[0].rect;
-        self.cam = overview(&layout);
+        self.cam = self.home_view(&layout);
         let n = layout.files.len();
         log!(
             "codescape: {} files, {} lines, {} dirs, world {:.0}x{:.0}, minimap texel {} in {:.2}s",
@@ -762,8 +909,7 @@ impl CodeScape {
             t0.elapsed().as_secs_f64()
         );
         if self.opts.tour {
-            let paths: Vec<&str> = sources.iter().map(|s| s.path.as_str()).collect();
-            let mut tour = Tour::for_repo(&layout, &paths, self.opts.tour_loop);
+            let mut tour = self.build_tour(&layout, &sources, self.opts.tour_loop);
             if let Some(at) = self.opts.at {
                 if let Some(c) = tour.advance(at) {
                     self.cam = c;
@@ -779,36 +925,29 @@ impl CodeScape {
             overlay,
             glyph_on: vec![false; n],
             glyph_count: 0,
+            visible_dirs: Vec::new(),
+            visible_files: Vec::new(),
         });
         if let Some(path) = self.opts.trace.clone() {
-            self.load_trace(&root, &path);
+            if let Err(error) = self.load_trace(&root, &path) {
+                if self.opts.record.is_some() || self.opts.shot.is_some() {
+                    crate::fail(error);
+                }
+                log!("codescape: {error}");
+            }
         }
     }
 
     /// Loads a Quint ITF counterexample and parks the camera on its spec.
-    fn load_trace(&mut self, root: &Path, path: &Path) {
-        let full = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            root.join(path)
-        };
-        let Ok(text) = std::fs::read_to_string(&full) else {
-            log!("codescape: cannot read trace {}", full.display());
-            return;
-        };
-        let Some(mut trace) = Trace::parse(&text) else {
-            log!("codescape: {} is not an ITF trace", full.display());
-            return;
-        };
-        let Some(scene) = self.scene.as_ref() else {
-            return;
-        };
+    fn load_trace(&mut self, root: &Path, path: &Path) -> Result<(), String> {
+        let full = root.join(path);
+        let text = std::fs::read_to_string(&full)
+            .map_err(|error| format!("cannot read trace {}: {error}", full.display()))?;
+        let mut trace = Trace::parse(&text)
+            .ok_or_else(|| format!("{} is not a valid nonempty ITF trace", full.display()))?;
+        let scene = self.scene.as_ref().expect("trace loads after the scene");
         if !trace.bind(&scene.sources) {
-            log!(
-                "codescape: trace names {}, which is not on the map",
-                trace.source
-            );
-            return;
+            return Err(format!("trace source {} is not on the map", trace.source));
         }
         let marked: usize = trace.var_lines.iter().map(|l| l.len()).sum();
         log!(
@@ -821,13 +960,8 @@ impl CodeScape {
         );
         let file = trace.file.unwrap_or_default();
         let tile = scene.layout.files.iter().position(|f| f.file == file);
-        let height = if self.rect.h > 1.0 {
-            self.rect.h as f32
-        } else {
-            1080.0
-        };
         if let Some(t) = tile {
-            self.cam = reading_view(&scene.layout, t, height);
+            self.cam = self.file_view(&scene.layout, t);
         }
         if let Some(rate) = self.opts.trace_rate {
             trace.step_secs = 1.0 / rate;
@@ -836,6 +970,7 @@ impl CodeScape {
         trace.looping = self.opts.record.is_none();
         self.trace = Some(trace);
         self.apply_trace();
+        Ok(())
     }
 
     /// Marks for this run: a git diff, a pull request, or nothing.
@@ -859,7 +994,18 @@ impl CodeScape {
             );
             return Overlay::empty(sources.len());
         };
-        let (ov, dropped) = diff::overlay(&patch, sources, label);
+        let (ov, dropped) = if self.opts.pr.is_some() {
+            let Some(result) = diff::pr_overlay(root, &patch, sources, label) else {
+                log!(
+                    "codescape: could not resolve the PR paths for {}",
+                    root.display()
+                );
+                return Overlay::empty(sources.len());
+            };
+            result
+        } else {
+            diff::overlay(&patch, sources, label)
+        };
         let (added, removed) = ov.totals();
         log!(
             "codescape: diff {} — {} files marked, +{} -{}, {} deleted, {} marks dropped past end of file",
@@ -874,8 +1020,44 @@ impl CodeScape {
     }
 
     fn view(&self) -> View {
-        self.cam
-            .view(self.rect.w.max(1.0) as f32, self.rect.h.max(1.0) as f32)
+        let (w, h) = self.view_size();
+        if self.opts.perspective {
+            self.cam.view(w, h)
+        } else {
+            self.cam.map_view(w, h)
+        }
+    }
+
+    fn view_size(&self) -> (f32, f32) {
+        (self.rect.w.max(1.0) as f32, self.rect.h.max(1.0) as f32)
+    }
+
+    fn home_view(&self, layout: &Layout) -> Camera {
+        let (w, h) = self.view_size();
+        if self.opts.perspective {
+            overview(layout)
+        } else {
+            Camera::fit_map(layout.dirs[0].rect, w, h)
+        }
+    }
+
+    fn file_view(&self, layout: &Layout, tile: usize) -> Camera {
+        let (w, h) = self.view_size();
+        if self.opts.perspective {
+            reading_view(layout, tile, h)
+        } else {
+            map_reading_view(layout, tile, w, h)
+        }
+    }
+
+    fn build_tour(&self, layout: &Layout, sources: &[SourceFile], looped: bool) -> Tour {
+        if self.opts.perspective {
+            let paths: Vec<&str> = sources.iter().map(|s| s.path.as_str()).collect();
+            Tour::for_repo(layout, &paths, looped)
+        } else {
+            let (w, h) = self.view_size();
+            Tour::for_map(layout, w, h, looped)
+        }
     }
 
     fn local(&self, abs: DVec2) -> (f32, f32) {
@@ -887,6 +1069,10 @@ impl CodeScape {
         let scene = self.scene.as_ref()?;
         let view = self.view();
         let (px, py) = self.local(abs);
+        if view.map_bounds.is_some() {
+            let p = view.hit_plane(px, py, 0.0)?;
+            return scene.layout.file_at(p.x, p.z);
+        }
         let d = view.ray(px, py);
         let mut best: Option<(f32, usize)> = None;
         for (i, f) in scene.layout.files.iter().enumerate() {
@@ -909,16 +1095,20 @@ impl CodeScape {
     fn cursor_ground(&self, abs: DVec2) -> Option<V3> {
         let view = self.view();
         let (px, py) = self.local(abs);
-        let y = self
-            .pick(abs)
-            .and_then(|f| self.scene.as_ref().map(|s| s.layout.files[f].y))
-            .unwrap_or(self.cam.target.y);
+        let y = if self.opts.perspective {
+            self.pick(abs)
+                .and_then(|f| self.scene.as_ref().map(|s| s.layout.files[f].y))
+                .unwrap_or(self.cam.target.y)
+        } else {
+            self.cam.target.y
+        };
         view.hit_plane(px, py, y)
     }
 
     fn fly_to(&mut self, cx: &mut Cx, to: Camera, secs: f64) {
         self.fly = Some((self.cam, to, None, secs));
         self.tour = None;
+        self.hover = None;
         self.request_frame(cx);
     }
 
@@ -946,6 +1136,8 @@ impl CodeScape {
         let Some(file) = tr.file else { return };
         let lines = scene.sources[file].line_count();
         tr.apply(&mut scene.overlay, lines);
+        self.has_overlay_tiles = true;
+        self.glyph_view = None;
     }
 
     fn request_frame(&mut self, cx: &mut Cx) {
@@ -953,7 +1145,9 @@ impl CodeScape {
     }
 
     fn animating(&self) -> bool {
-        self.trace.as_ref().is_some_and(|t| t.playing)
+        self.trace
+            .as_ref()
+            .is_some_and(|t| t.playing && t.states.len() > 1)
             || self.fly.is_some()
             || self.tour.is_some()
             || !self.keys.is_empty()
@@ -986,9 +1180,7 @@ impl CodeScape {
             // tour by a fixed step so the video is smooth at any render speed.
             if self.frame_index > 2 {
                 let name = format!("f{:05}.png", self.frame_index - 3);
-                if !self.queue_capture(cx, dir.join(name), false) {
-                    return;
-                }
+                self.queue_capture(cx, dir.join(name), false);
             }
             self.frame_index += 1;
         }
@@ -1029,7 +1221,7 @@ impl CodeScape {
         }
         if !self.keys.is_empty() {
             let upp = self.cam.units_per_px(self.rect.h as f32) * 600.0 * dt as f32;
-            for k in self.keys.clone() {
+            for &k in &self.keys {
                 match k {
                     KeyCode::KeyW | KeyCode::ArrowUp => {
                         self.cam.target = self.cam.target.add(self.cam.ground_forward().scale(upp))
@@ -1056,6 +1248,10 @@ impl CodeScape {
         self.area.redraw(cx);
         if self.animating() && self.pending_capture.is_none() {
             self.request_frame(cx);
+        } else {
+            // The next input starts a new animation. Time spent idle must
+            // not count toward the first movement or trace step.
+            self.last_time = 0.0;
         }
     }
 
@@ -1064,34 +1260,52 @@ impl CodeScape {
             return;
         };
 
-        // Glyphs are collected first: tiles need to know which files have
-        // them, but must be drawn before them.
-        let mut glyphs = std::mem::take(&mut self.glyph_buf);
-        glyphs.clear();
-        collect_glyphs(scene, view, &mut glyphs);
-        let scene = self.scene.as_ref().unwrap();
+        // Hover and HUD redraws reuse the text geometry and visible tiles.
+        let glyph_view = (self.cam, view.size);
+        if self.glyph_view != Some(glyph_view) {
+            self.glyph_buf.clear();
+            collect_glyphs(scene, view, &mut self.glyph_buf);
+            self.glyph_view = Some(glyph_view);
+        }
         let layout = &scene.layout;
         let accent = |d: usize| hex(ACCENTS[layout.dirs[d].top_level % ACCENTS.len()]);
 
-        // Directory blocks.
-        self.draw_box.begin(cx, view);
-        for (i, d) in layout.dirs.iter().enumerate() {
+        if self.opts.perspective {
+            self.draw_box.begin(cx, view);
+        } else {
+            self.draw_map_dir.begin(cx, view);
+        }
+        for &i in &scene.visible_dirs {
+            let d = &layout.dirs[i];
             let r = d.rect;
             let lift = (d.depth as f32 * 0.018).min(0.09);
-            self.draw_box.box_pos = vec3(r.x, d.y_base, r.z);
-            self.draw_box.box_size = vec3(r.w, d.y_top - d.y_base, r.h);
-            self.draw_box.top = vec4(0.063 + lift, 0.086 + lift, 0.16 + lift * 1.3, 1.0);
+            let fill = vec4(0.063 + lift, 0.086 + lift, 0.16 + lift * 1.3, 1.0);
             let a = if i == 0 { hex(0x232A3E) } else { accent(i) };
-            self.draw_box.rim = rgba(a, (d.label_h * 0.08).max(0.4));
-            self.draw_box.draw();
+            let rim = rgba(a, (d.label_h * 0.08).max(0.4));
+            if self.opts.perspective {
+                self.draw_box.box_pos = vec3(r.x, d.y_base, r.z);
+                self.draw_box.box_size = vec3(r.w, d.y_top - d.y_base, r.h);
+                self.draw_box.top = fill;
+                self.draw_box.rim = rim;
+                self.draw_box.draw();
+            } else {
+                self.draw_map_dir.rect = vec4(r.x, r.z, r.w, r.h);
+                self.draw_map_dir.fill = fill;
+                self.draw_map_dir.rim = rim;
+                self.draw_map_dir.draw();
+            }
         }
-        self.draw_box.end(cx);
+        if self.opts.perspective {
+            self.draw_box.end(cx);
+        } else {
+            self.draw_map_dir.end(cx);
+        }
 
         // File tiles. With an overlay active, changed files keep their rim and
         // everything else recedes, so the shape of the change reads from above.
-        let marked = scene.overlay.touched() > 0;
         self.draw_tile.begin(cx, view);
-        for (i, f) in layout.files.iter().enumerate() {
+        for &i in &scene.visible_files {
+            let f = &layout.files[i];
             let t = f.tile;
             self.draw_tile.tile = vec4(t.x, t.z, t.w, t.h);
             self.draw_tile.elev = f.y;
@@ -1100,7 +1314,7 @@ impl CodeScape {
                 Some(fo) => {
                     let (c, base) = match fo.state {
                         FileState::Added => (hex(0x32D74B), 0.55),
-                        FileState::Modified => (hex(0xF2A33C), 0.45),
+                        FileState::Modified | FileState::Renamed => (hex(0xF2A33C), 0.45),
                         FileState::Deleted => (hex(0xE5484D), 0.45),
                     };
                     // Churn lifts the rim, so a big change is brighter than a typo.
@@ -1108,7 +1322,7 @@ impl CodeScape {
                     self.draw_tile.bg = vec4(0.05, 0.062, 0.115, 1.0);
                     self.draw_tile.rim = rgba(c, a);
                 }
-                None if marked => {
+                None if self.has_overlay_tiles => {
                     self.draw_tile.bg = vec4(0.022, 0.03, 0.062, 1.0);
                     self.draw_tile.rim = rgba(accent(f.dir), 0.1);
                 }
@@ -1125,9 +1339,8 @@ impl CodeScape {
 
         self.draw_glyph.begin(cx, view);
         debug_assert_eq!(self.draw_glyph.draw_vars.as_slice().len(), GLYPH_SLOTS);
-        self.draw_glyph.push(&glyphs);
+        self.draw_glyph.push(&self.glyph_buf);
         self.draw_glyph.end(cx);
-        self.glyph_buf = glyphs;
     }
 
     fn draw_hud(&mut self, cx: &mut Cx2d) {
@@ -1151,11 +1364,11 @@ impl CodeScape {
         self.draw_title
             .draw_abs(cx, dvec2(x + 30.0, y + 26.0), "FLOP  codescape");
         let stats = format!(
-            "{} @ {}\n{} files  {:.2}M lines  {} dirs",
+            "{} @ {}\n{} files  {} lines  {} dirs",
             scene.repo,
             scene.revision,
             l.files.len(),
-            l.total_lines as f64 / 1e6,
+            l.total_lines,
             l.dirs.len()
         );
         self.draw_dim
@@ -1166,14 +1379,14 @@ impl CodeScape {
             format!(
                 "{:>7} glyphs   {} tiles   GPU instanced",
                 scene.glyph_count,
-                l.files.len()
+                scene.visible_files.len()
             )
         } else if self.animating() {
             format!(
                 "{:>3.0} fps   {:>7} glyphs   {} tiles",
                 self.fps,
                 scene.glyph_count,
-                l.files.len()
+                scene.visible_files.len()
             )
         } else {
             // The counter only runs while something animates; between
@@ -1181,7 +1394,7 @@ impl CodeScape {
             format!(
                 "   idle   {:>7} glyphs   {} tiles",
                 scene.glyph_count,
-                l.files.len()
+                scene.visible_files.len()
             )
         };
         self.draw_panel.draw_abs(
@@ -1218,48 +1431,17 @@ impl CodeScape {
                 .draw_abs(cx, dvec2(x + 30.0, y + 122.0), "quint counterexample");
             self.draw_dim
                 .draw_abs(cx, dvec2(x + 30.0, y + 148.0), &body);
-        } else if scene.overlay.touched() > 0 || !scene.overlay.deleted.is_empty() {
-            let ov = &scene.overlay;
-            let (added, removed) = ov.totals();
-            let mut body = format!(
-                "{}\n{} files changed   +{}  -{}",
-                ov.label,
-                ov.touched(),
-                added,
-                removed
-            );
-            // The busiest files, which is what a reviewer wants to find first.
-            let mut top: Vec<(usize, &crate::overlay::FileOverlay)> = ov
-                .files
-                .iter()
-                .enumerate()
-                .filter_map(|(i, f)| f.as_ref().map(|f| (i, f)))
-                .collect();
-            top.sort_by_key(|(_, f)| std::cmp::Reverse(f.churn()));
-            for (i, f) in top.iter().take(6) {
-                body.push_str(&format!(
-                    "\n{} +{:<5} -{:<5} {}",
-                    f.state.tag(),
-                    f.added,
-                    f.removed,
-                    scene.sources[*i].path
-                ));
-            }
-            for (path, removed) in ov.deleted.iter().take(3) {
-                body.push_str(&format!("\nD       -{:<5} {}", removed, path));
-            }
-            let rows = 2.0 + top.len().min(6) as f64 + ov.deleted.len().min(3) as f64;
+        } else if let Some((body, rows)) = &self.diff_summary {
             self.draw_panel.draw_abs(
                 cx,
                 Rect {
                     pos: dvec2(x + 16.0, y + 112.0),
-                    size: dvec2(560.0, 26.0 + rows * 17.0),
+                    size: dvec2(560.0, 26.0 + *rows as f64 * 17.0),
                 },
             );
             self.draw_title
                 .draw_abs(cx, dvec2(x + 30.0, y + 122.0), "changed files");
-            self.draw_dim
-                .draw_abs(cx, dvec2(x + 30.0, y + 148.0), &body);
+            self.draw_dim.draw_abs(cx, dvec2(x + 30.0, y + 148.0), body);
         }
 
         if let Some(hf) = self.hover {
@@ -1293,7 +1475,11 @@ impl CodeScape {
             );
         }
         if self.opts.record.is_none() {
-            let help = "drag pan  |  right-drag orbit  |  wheel zoom  |  click file: fly in  |  WASD QE RF  |  T tour  H home";
+            let help = if self.opts.perspective {
+                "drag pan  |  right-drag orbit  |  wheel zoom  |  click file: fly in  |  WASD QE RF  |  T tour  H home"
+            } else {
+                "drag / WASD pan  |  wheel / ZX zoom  |  click file  |  T tour  |  H fit map"
+            };
             self.draw_panel.draw_abs(
                 cx,
                 Rect {
@@ -1312,18 +1498,26 @@ impl Widget for CodeScape {
         if !self.opts.parsed {
             self.opts = Options::parse();
         }
-        if let Event::Signal = event {
-            self.drain_captures(cx);
+        match event {
+            Event::Signal => self.drain_captures(cx),
+            Event::WindowGotFocus(_) => cx.set_key_focus(self.area),
+            Event::WindowLostFocus(_) => self.keys.clear(),
+            _ => {}
         }
         if let Some(ne) = self.next_frame.is_event(event) {
             self.tick(cx, ne.time);
         }
+        // A capture follows its scripted camera and ends when that script ends.
+        if self.opts.record.is_some() || self.opts.shot.is_some() {
+            return;
+        }
         match event.hits(cx, self.area) {
             Hit::FingerDown(fe) => {
                 cx.set_key_focus(self.area);
-                let orbit = fe.device.mouse_button().is_some_and(|b| !b.is_primary())
-                    || fe.modifiers.shift
-                    || fe.modifiers.alt;
+                let orbit = self.opts.perspective
+                    && (fe.device.mouse_button().is_some_and(|b| !b.is_primary())
+                        || fe.modifiers.shift
+                        || fe.modifiers.alt);
                 self.drag = Some((if orbit { Drag::Orbit } else { Drag::Pan }, fe.abs));
                 self.tour = None;
                 self.fly = None;
@@ -1334,7 +1528,11 @@ impl Widget for CodeScape {
                     match mode {
                         Drag::Pan => {
                             let upp = self.cam.units_per_px(self.rect.h as f32);
-                            let fwd = upp / self.cam.pitch.sin().max(0.35);
+                            let fwd = if self.opts.perspective {
+                                upp / self.cam.pitch.sin().max(0.35)
+                            } else {
+                                upp
+                            };
                             self.cam.target = self
                                 .cam
                                 .target
@@ -1355,7 +1553,7 @@ impl Widget for CodeScape {
                 self.drag = None;
                 if fe.is_over && (fe.abs - fe.abs_start).length() < 4.0 {
                     if let (Some(f), Some(scene)) = (self.pick(fe.abs), self.scene.as_ref()) {
-                        let to = reading_view(&scene.layout, f, self.rect.h as f32);
+                        let to = self.file_view(&scene.layout, f);
                         self.fly_to(cx, to, 1.2);
                     }
                 }
@@ -1402,9 +1600,7 @@ impl Widget for CodeScape {
                 KeyCode::KeyT => {
                     if let Some(scene) = self.scene.as_ref() {
                         self.fly = None;
-                        let paths: Vec<&str> =
-                            scene.sources.iter().map(|s| s.path.as_str()).collect();
-                        let mut t = Tour::for_repo(&scene.layout, &paths, true);
+                        let mut t = self.build_tour(&scene.layout, &scene.sources, true);
                         t.start_from(self.cam);
                         self.tour = Some(t);
                         self.request_frame(cx);
@@ -1412,7 +1608,7 @@ impl Widget for CodeScape {
                 }
                 KeyCode::KeyH | KeyCode::Home => {
                     if let Some(scene) = self.scene.as_ref() {
-                        let to = overview(&scene.layout);
+                        let to = self.home_view(&scene.layout);
                         self.fly_to(cx, to, 1.2);
                     }
                 }
@@ -1435,13 +1631,31 @@ impl Widget for CodeScape {
                     self.tour = None;
                     self.fly = None;
                 }
-                k => {
+                k @ (KeyCode::KeyW
+                | KeyCode::KeyA
+                | KeyCode::KeyS
+                | KeyCode::KeyD
+                | KeyCode::ArrowUp
+                | KeyCode::ArrowDown
+                | KeyCode::ArrowLeft
+                | KeyCode::ArrowRight
+                | KeyCode::KeyZ
+                | KeyCode::KeyX) => {
                     if !ke.is_repeat && !self.keys.contains(&k) {
                         self.keys.push(k);
                         self.tour = None;
+                        self.fly = None;
                         self.request_frame(cx);
                     }
                 }
+                k @ (KeyCode::KeyQ | KeyCode::KeyE | KeyCode::KeyR | KeyCode::KeyF)
+                    if self.opts.perspective && !ke.is_repeat && !self.keys.contains(&k) =>
+                {
+                    self.keys.push(k);
+                    self.tour = None;
+                    self.request_frame(cx);
+                }
+                _ => {}
             },
             Hit::KeyUp(ke) => self.keys.retain(|k| *k != ke.key_code),
             _ => {}
@@ -1462,7 +1676,6 @@ impl Widget for CodeScape {
         if r.size.x <= 1.0 || r.size.y <= 1.0 {
             return DrawStep::done();
         }
-        self.ensure_render_targets(cx.cx);
         if self.scene.is_none() {
             self.load(cx);
             self.last_time = 0.0;
@@ -1473,16 +1686,27 @@ impl Widget for CodeScape {
         }
         let view = self.view();
 
+        let fills_window = r.pos.x.abs() < 0.01
+            && r.pos.y.abs() < 0.01
+            && (r.size - cx.current_pass_size()).length() < 0.01;
+        if !self.opts.perspective
+            && self.opts.shot.is_none()
+            && self.opts.record.is_none()
+            && fills_window
+            && matches!(cx.gpu_backend(), GpuBackend::Vulkan)
+        {
+            self.draw_scene(cx, &view);
+            self.draw_hud(cx);
+            return DrawStep::done();
+        }
+
+        self.ensure_render_targets(cx.cx);
+
         self.scene_pass.set_size(cx, r.size);
         self.scene_pass.set_color_texture(
             cx,
             &self.scene_color,
             DrawPassClearColor::ClearWith(self.clear_color),
-        );
-        self.scene_pass.set_depth_texture(
-            cx,
-            &self.scene_depth,
-            DrawPassClearDepth::ClearWith(1.0),
         );
         cx.make_child_pass(&self.scene_pass);
         // Captures are 1920x1080 rather than Retina-sized, and remain within
@@ -1492,6 +1716,15 @@ impl Widget for CodeScape {
         cx.begin_pass(&self.scene_pass, capture_dpi);
         self.scene_draw_list.begin_always(cx);
         cx.begin_root_turtle(r.size, makepad_widgets::Layout::flow_overlay());
+        let mut view = view;
+        if !self.opts.perspective
+            && matches!(cx.gpu_backend(), GpuBackend::OpenGl | GpuBackend::WebGl)
+        {
+            // Custom clip-space draws use GL's bottom-left origin in the child pass.
+            for i in [1, 5, 9, 13] {
+                view.view_proj[i] = -view.view_proj[i];
+            }
+        }
         self.draw_scene(cx, &view);
         let parent_rect = self.rect;
         self.rect.x = 0.0;
@@ -1504,8 +1737,8 @@ impl Widget for CodeScape {
 
         self.draw_scene_texture.set_texture(&self.scene_color);
         self.draw_scene_texture.draw_abs(cx, r);
-        self.area = self.draw_scene_texture.area();
-        cx.set_pass_area(&self.scene_pass, self.area);
+        // Keep the turtle area for input so Makepad carries focus across redraws.
+        cx.set_pass_area(&self.scene_pass, self.draw_scene_texture.area());
         DrawStep::done()
     }
 }

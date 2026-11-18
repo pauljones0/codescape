@@ -2,13 +2,13 @@
 //! given camera needs. None of this touches the renderer, so it can be tested
 //! and benchmarked without a GPU or a window.
 
-use crate::atlas::{glyph_index, FONT_COLS};
+use crate::atlas::glyph_index;
 use crate::camera::{v3, Camera, View, V3};
-use crate::layout::{Layout, Rect as GRect, COL_CHARS, FILE_LABEL_H, LINE_H};
+use crate::layout::{Layout, Rect as GRect, COL_CHARS, COL_GUTTER, FILE_LABEL_H, LINE_H};
 use crate::overlay::{mark_palette, Overlay, M_NONE};
 use crate::scan::{SourceFile, CLASS_COUNT};
 
-pub const GLYPH_SLOTS: usize = 13;
+pub const GLYPH_SLOTS: usize = 9;
 
 pub const GLYPH_BUDGET: usize = 450_000;
 /// Minimum on-screen line height (px) before a file gets real glyphs.
@@ -51,25 +51,25 @@ pub struct Scene {
     pub overlay: Overlay,
     pub glyph_on: Vec<bool>,
     pub glyph_count: usize,
+    pub visible_dirs: Vec<usize>,
+    pub visible_files: Vec<usize>,
 }
 
 /// Instance slots for one glyph, in `DrawGlyph` field order.
 #[rustfmt::skip]
-fn glyph(pos: V3, size: (f32, f32), ch: u8, fade: (f32, f32), col: [f32; 3]) -> [f32; GLYPH_SLOTS] {
-    let gi = glyph_index(ch);
+fn glyph(pos: V3, height: f32, ch: u8, fade_start: f32, col: [f32; 3]) -> [f32; GLYPH_SLOTS] {
     [
-        pos.x, pos.y, pos.z, size.0, size.1,
-        (gi % FONT_COLS) as f32, (gi / FONT_COLS) as f32,
-        fade.0, fade.1, col[0], col[1], col[2], 1.0,
+        pos.x, pos.y, pos.z, height, glyph_index(ch) as f32, fade_start,
+        col[0], col[1], col[2],
     ]
 }
 
 /// A flat label with glyph cells `h` tall starting at `pos`.
-fn push_label(out: &mut Vec<f32>, text: &[u8], pos: V3, h: f32, col: [f32; 3], fade: (f32, f32)) {
+fn push_label(out: &mut Vec<f32>, text: &[u8], pos: V3, h: f32, col: [f32; 3], fade_start: f32) {
     for (k, ch) in text.iter().enumerate() {
         if *ch != b' ' {
             let p = v3(pos.x + k as f32 * h * 0.5, pos.y, pos.z);
-            out.extend_from_slice(&glyph(p, (h * 0.5, h), *ch, fade, col));
+            out.extend_from_slice(&glyph(p, h, *ch, fade_start, col));
         }
     }
 }
@@ -81,7 +81,16 @@ pub fn collect_glyphs(scene: &mut Scene, view: &View, out: &mut Vec<f32>) {
     let palette = syntax_palette();
     let marks = mark_palette();
     let accent = |d: usize| hex(ACCENTS[layout.dirs[d].top_level % ACCENTS.len()]);
-    for (i, d) in layout.dirs.iter().enumerate() {
+    scene.visible_dirs.clear();
+    scene.visible_files.clear();
+    if let Some(bounds) = view.map_bounds {
+        layout.visible_nodes(&bounds, &mut scene.visible_dirs, &mut scene.visible_files);
+    } else {
+        scene.visible_dirs.extend(0..layout.dirs.len());
+        scene.visible_files.extend(0..layout.files.len());
+    }
+    for &i in &scene.visible_dirs {
+        let d = &layout.dirs[i];
         let r = d.rect;
         let h = d.label_h;
         let label_rect = GRect {
@@ -103,38 +112,47 @@ pub fn collect_glyphs(scene: &mut Scene, view: &View, out: &mut Vec<f32>) {
             format!("{}/", d.name)
         };
         let pos = v3(r.x + pad, d.y_top, r.z + pad * 0.6 + h * 0.2);
-        push_label(out, name.as_bytes(), pos, h, col, (1.5, 3.0));
+        push_label(out, name.as_bytes(), pos, h, col, 1.5);
     }
-    for f in &layout.files {
-        let lr = GRect {
-            x: f.tile.x,
-            z: f.tile.z - FILE_LABEL_H - 2.0,
-            w: f.tile.w,
-            h: FILE_LABEL_H,
-        };
-        if line_px(view, &lr, f.y) * FILE_LABEL_H / LINE_H < 2.0 || !on_screen(view, &lr, f.y) {
-            continue;
+    let map_line_px = view.map_bounds.map(|_| LINE_H * view.focal_px);
+    if map_line_px.is_none_or(|px| px * FILE_LABEL_H / LINE_H >= 2.0) {
+        for &i in &scene.visible_files {
+            let f = &layout.files[i];
+            let lr = f.label_rect();
+            if line_px(view, &lr, f.y) * FILE_LABEL_H / LINE_H < 2.0 || !on_screen(view, &lr, f.y) {
+                continue;
+            }
+            let pos = v3(lr.x, f.y, lr.z);
+            push_label(
+                out,
+                f.name.as_bytes(),
+                pos,
+                FILE_LABEL_H,
+                hex(0xDDE3EA),
+                2.0,
+            );
         }
-        let pos = v3(lr.x, f.y, lr.z);
-        push_label(
-            out,
-            f.name.as_bytes(),
-            pos,
-            FILE_LABEL_H,
-            hex(0xDDE3EA),
-            (2.0, 4.0),
-        );
+    }
+    if map_line_px.is_some_and(|px| px < GLYPH_MIN_PX) {
+        for &i in &scene.visible_files {
+            scene.glyph_on[i] = false;
+        }
+        scene.glyph_count = out.len() / GLYPH_SLOTS;
+        return;
     }
 
     let mut cand: Vec<(f32, usize)> = Vec::new();
-    for (i, f) in layout.files.iter().enumerate() {
+    for &i in &scene.visible_files {
+        let f = &layout.files[i];
         scene.glyph_on[i] = false;
         let px = line_px(view, &f.tile, f.y);
         if px >= GLYPH_MIN_PX && on_screen(view, &f.tile, f.y) {
             cand.push((px, i));
         }
     }
-    cand.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    if view.map_bounds.is_none() {
+        cand.sort_by(|a, b| b.0.total_cmp(&a.0));
+    }
     for &(_, i) in &cand {
         if out.len() / GLYPH_SLOTS >= GLYPH_BUDGET {
             break;
@@ -143,34 +161,39 @@ pub fn collect_glyphs(scene: &mut Scene, view: &View, out: &mut Vec<f32>) {
         let f = &layout.files[i];
         let src = &scene.sources[f.file];
         let region = visible_region(view, f.y);
-        for line in 0..src.line_count() {
-            let (x0, z0) = f.char_pos(line);
-            if z0 + LINE_H < region.z
-                || z0 > region.z + region.h
-                || x0 + (COL_CHARS as f32) < region.x
-                || x0 > region.x + region.w
-            {
-                continue;
-            }
-            let (text, class) = src.line(line);
-            let mark = scene.overlay.mark(f.file, line);
-            let c0 = (region.x - x0).floor().max(0.0) as usize;
-            let c1 = ((region.x + region.w - x0).ceil().max(0.0) as usize)
-                .min(COL_CHARS)
-                .min(text.len());
-            for c in c0..c1 {
-                let ch = text[c];
-                if ch == b' ' {
-                    continue;
+        let col_width = COL_CHARS as f32 + COL_GUTTER;
+        let first_col = ((region.x - f.tile.x) / col_width).floor() as usize;
+        let last_col = (((region.x + region.w - f.tile.x) / col_width).floor() as usize)
+            .min((f.lines - 1) / f.lines_per_col);
+        let first_row = ((region.z - f.tile.z) / LINE_H).floor() as usize;
+        let end_row =
+            (((region.z + region.h - f.tile.z) / LINE_H).ceil() as usize).min(f.lines_per_col);
+        for col in first_col..=last_col {
+            let col_start = col * f.lines_per_col;
+            let x0 = f.tile.x + col as f32 * col_width;
+            let c0 = (region.x - x0).floor() as usize;
+            let c1 = ((region.x + region.w - x0).ceil() as usize).min(COL_CHARS);
+            for line in col_start + first_row..(col_start + end_row).min(f.lines) {
+                let z0 = f.tile.z + (line - col_start) as f32 * LINE_H;
+                let (text, class) = src.line(line);
+                let mark = scene.overlay.mark(f.file, line);
+                for c in c0..c1.min(text.len()) {
+                    let ch = text[c];
+                    if ch == b' ' {
+                        continue;
+                    }
+                    if out.len() / GLYPH_SLOTS >= GLYPH_BUDGET {
+                        scene.glyph_count = out.len() / GLYPH_SLOTS;
+                        return;
+                    }
+                    let pos = v3(x0 + c as f32, f.y, z0);
+                    let color = if mark == M_NONE {
+                        palette[class[c] as usize]
+                    } else {
+                        marks[mark as usize]
+                    };
+                    out.extend_from_slice(&glyph(pos, LINE_H, ch, GLYPH_MIN_PX, color));
                 }
-                let pos = v3(x0 + c as f32, f.y, z0);
-                let col = if mark == M_NONE {
-                    palette[class[c] as usize]
-                } else {
-                    marks[mark as usize]
-                };
-                let fade = (GLYPH_MIN_PX, GLYPH_MIN_PX * 2.0);
-                out.extend_from_slice(&glyph(pos, (1.0, LINE_H), ch, fade, col));
             }
         }
     }
@@ -179,6 +202,9 @@ pub fn collect_glyphs(scene: &mut Scene, view: &View, out: &mut Vec<f32>) {
 
 /// On-screen height in pixels of one text line at the nearest point of `r`.
 fn line_px(view: &View, r: &GRect, y: f32) -> f32 {
+    if view.map_bounds.is_some() {
+        return LINE_H * view.focal_px;
+    }
     let nx = view.eye.x.clamp(r.x, r.x + r.w);
     let nz = view.eye.z.clamp(r.z, r.z + r.h);
     let d = v3(nx, y, nz).sub(view.eye).len().max(1e-3);
@@ -187,6 +213,9 @@ fn line_px(view: &View, r: &GRect, y: f32) -> f32 {
 
 /// Conservative test whether a ground rectangle intersects the viewport.
 fn on_screen(view: &View, r: &GRect, y: f32) -> bool {
+    if let Some(bounds) = view.map_bounds {
+        return bounds.intersects(r);
+    }
     let (w, h) = view.size;
     let corners = [
         (r.x, r.z),
@@ -213,6 +242,9 @@ fn on_screen(view: &View, r: &GRect, y: f32) -> bool {
 /// Ground-plane rectangle (at height `y`) that can hold readable glyphs:
 /// the view footprint, limited to where a line is at least `GLYPH_MIN_PX`.
 fn visible_region(view: &View, y: f32) -> GRect {
+    if let Some(bounds) = view.map_bounds {
+        return bounds;
+    }
     let reach = LINE_H * view.focal_px / GLYPH_MIN_PX;
     let dy = (view.eye.y - y).abs();
     let r = (reach * reach - dy * dy).max(0.0).sqrt();
@@ -279,4 +311,15 @@ pub fn reading_view(l: &Layout, f: usize, height_px: f32) -> Camera {
         yaw: 0.0,
         pitch: 1.05,
     }
+}
+
+pub fn map_reading_view(l: &Layout, f: usize, width: f32, height: f32) -> Camera {
+    let f = &l.files[f];
+    let units_per_px = LINE_H / 16.0;
+    Camera::map_at(
+        f.tile.x + (COL_CHARS as f32).min(width * units_per_px * 0.88) * 0.5,
+        f.label_rect().z + height * units_per_px * 0.4,
+        units_per_px,
+        height,
+    )
 }

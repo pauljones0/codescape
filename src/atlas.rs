@@ -12,6 +12,12 @@ pub struct Image {
     pub data: Vec<u32>,
 }
 
+pub fn parse_size(arg: Option<String>) -> Result<usize, &'static str> {
+    arg.and_then(|s| s.parse().ok())
+        .filter(|&size| size >= 3)
+        .ok_or("--atlas requires an integer of at least 3 pixels")
+}
+
 fn pack(c: [f32; 3], a: f32) -> u32 {
     let b = |v: f32| (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32;
     (b(a) << 24) | (b(c[0]) << 16) | (b(c[1]) << 8) | b(c[2])
@@ -29,7 +35,14 @@ pub fn build_minimap(
     overlay: &Overlay,
     max_size: usize,
     mip_levels: usize,
-) -> (Image, f32) {
+) -> Result<(Image, f32), String> {
+    let side = max_size / 3;
+    if side == 0 || layout.files.len().div_ceil(side) > side {
+        return Err(format!(
+            "{} files cannot fit within a {max_size}×{max_size} minimap (each tile needs at least 3×3 pixels)",
+            layout.files.len(),
+        ));
+    }
     let mut order: Vec<usize> = (0..layout.files.len()).collect();
     order.sort_by(|a, b| {
         layout.files[*b]
@@ -39,68 +52,113 @@ pub fn build_minimap(
             .unwrap()
     });
     let mut placed = Vec::new();
-    let mut texel = 1.0f32;
-    let mut height = 0;
-    for t in [1.0f32, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0] {
+    let max_tile = layout
+        .files
+        .iter()
+        .map(|f| f.tile.w.max(f.tile.h))
+        .fold(16.0f32, f32::max);
+    let extra_steps = std::iter::successors((max_tile > 16.0).then_some(16.0), |&last| {
+        (last < max_tile).then_some((last * 1.5).min(max_tile))
+    })
+    .skip(1);
+    let steps = [1.0f32, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]
+        .into_iter()
+        .chain(extra_steps);
+    let mut fit = None;
+    for t in steps {
         placed.clear();
         let (mut x, mut y, mut row_h) = (0usize, 0usize, 0usize);
+        let mut used_width = 0;
         for &f in &order {
             let r = layout.files[f].tile;
             let w = (r.w / t).ceil() as usize + 2;
             let h = (r.h / t).ceil() as usize + 2;
-            if x + w > max_size {
+            if w > max_size || h > max_size {
+                break;
+            }
+            if w > max_size - x {
                 x = 0;
                 y += row_h;
                 row_h = 0;
             }
+            if h > max_size - y {
+                break;
+            }
             placed.push((f, x, y, w, h));
             x += w;
+            used_width = used_width.max(x);
             row_h = row_h.max(h);
         }
-        height = y + row_h;
-        texel = t;
-        if height <= max_size {
+        if placed.len() == order.len() {
+            fit = Some((used_width, y + row_h, t));
             break;
         }
     }
-    let width = max_size;
-    let height = height.next_multiple_of(64);
-    let mut data = Vec::with_capacity(width * height + mip_chain_extra(width, height, mip_levels));
-    data.resize(width * height, 0u32);
+    let (used_width, used_height, texel) =
+        fit.ok_or_else(|| format!("minimap does not fit within {max_size}×{max_size} pixels"))?;
+    let padded = |n: usize| {
+        n.max(1)
+            .checked_next_multiple_of(64)
+            .unwrap_or(n)
+            .min(max_size)
+    };
+    let width = padded(used_width);
+    let height = padded(used_height);
+    let pixels = width
+        .checked_mul(height)
+        .filter(|&n| n <= isize::MAX as usize / 8)
+        .ok_or("minimap is too large to allocate")?;
+    let mip_levels = mip_levels.min(width.max(height).ilog2() as usize);
+    let mut data = Vec::new();
+    data.try_reserve_exact(pixels + mip_chain_extra(width, height, mip_levels))
+        .map_err(|error| format!("cannot allocate {width}×{height} minimap: {error}"))?;
+    data.resize(pixels, 0u32);
 
-    // Rasterise files in parallel; each thread writes to its own buffers.
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    let chunk = placed.len().div_ceil(threads).max(1);
-    // (file, atlas x, atlas y, width, texels) per rasterised file.
-    type Rastered = (usize, usize, usize, usize, Vec<u32>);
-    let results: Vec<Vec<Rastered>> = std::thread::scope(|s| {
-        let handles: Vec<_> = placed
-            .chunks(chunk)
-            .map(|part| {
-                let layout = &*layout;
-                let src_of = Source {
-                    layout,
-                    sources,
-                    palette,
-                    overlay,
-                };
-                s.spawn(move || {
-                    part.iter()
-                        .map(|&(f, x, y, w, h)| (f, x, y, w, raster_file(src_of, f, w, h, texel)))
-                        .collect()
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    for (f, x, y, w, img) in results.into_iter().flatten() {
-        let h = img.len() / w;
-        for row in 0..h {
-            let dst = (y + row) * width + x;
-            data[dst..dst + w].copy_from_slice(&img[row * w..(row + 1) * w]);
+    let src = Source {
+        layout,
+        sources,
+        palette,
+        overlay,
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(3, |n| n.get().saturating_sub(1))
+        .max(1)
+        .min(placed.len());
+    let mut copy_tile = |x, y, w, pixels: &[u32]| {
+        for (row, pixels) in pixels.chunks_exact(w).enumerate() {
+            let start = (y + row) * width + x;
+            data[start..start + w].copy_from_slice(pixels);
         }
+    };
+    if workers <= 1 {
+        for &(f, x, y, w, h) in &placed {
+            copy_tile(x, y, w, &raster_file(src, f, w, h, texel));
+        }
+    } else {
+        // Copy finished tiles while workers rasterise the rest. The bounded
+        // queue keeps temporary pixels proportional to the number of workers.
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::sync_channel(workers);
+            for worker in 0..workers {
+                let send = send.clone();
+                let placed = &placed;
+                scope.spawn(move || {
+                    // Interleave the height-sorted tiles to balance worker loads.
+                    for &(f, x, y, w, h) in placed.iter().skip(worker).step_by(workers) {
+                        let pixels = raster_file(src, f, w, h, texel);
+                        if send.send((x, y, w, pixels)).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            drop(send);
+            for (x, y, w, pixels) in receive {
+                copy_tile(x, y, w, &pixels);
+            }
+        });
+    }
+    for (f, x, y, _, _) in placed {
         let r = layout.files[f].tile;
         layout.files[f].uv = [
             (x as f32 + 1.0) / width as f32,
@@ -109,14 +167,14 @@ pub fn build_minimap(
             (y as f32 + 1.0 + r.h / texel) / height as f32,
         ];
     }
-    (
+    Ok((
         Image {
             width,
             height,
             data,
         },
         texel,
-    )
+    ))
 }
 
 /// Everything a file's minimap is rasterised from, other than its own size.
@@ -197,13 +255,8 @@ pub fn glyph_index(ch: u8) -> usize {
 /// monospace TTF whose advance is 0.6 em. One cell is one character wide and
 /// one text line tall.
 pub fn build_font(ttf: &[u8]) -> Image {
-    const HS: usize = 6;
     let font =
         fontdue::Font::from_bytes(ttf, fontdue::FontSettings::default()).expect("font parse");
-    let (cw, ch) = (FONT_CELL_W * HS, FONT_CELL_H * HS);
-    let px = cw as f32 / 0.6;
-    let lm = font.horizontal_line_metrics(px).expect("line metrics");
-    let baseline = (ch as f32 - (lm.ascent - lm.descent)) * 0.5 + lm.ascent;
     let width = FONT_COLS * FONT_CELL_W;
     let height = FONT_ROWS * FONT_CELL_H;
     let mut data = vec![0u32; width * height];
@@ -211,6 +264,35 @@ pub fn build_font(ttf: &[u8]) -> Image {
         .map(|c| c as char)
         .chain(['\u{00b7}'])
         .collect();
+    let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let rows_per_job = FONT_ROWS.div_ceil(workers);
+    if rows_per_job == FONT_ROWS {
+        raster_font_rows(&font, &chars, &mut data);
+    } else {
+        std::thread::scope(|scope| {
+            for (chars, pixels) in chars
+                .chunks(FONT_COLS * rows_per_job)
+                .zip(data.chunks_mut(width * FONT_CELL_H * rows_per_job))
+            {
+                let font = &font;
+                scope.spawn(move || raster_font_rows(font, chars, pixels));
+            }
+        });
+    }
+    Image {
+        width,
+        height,
+        data,
+    }
+}
+
+fn raster_font_rows(font: &fontdue::Font, chars: &[char], data: &mut [u32]) {
+    const HS: usize = 6;
+    let (cw, ch) = (FONT_CELL_W * HS, FONT_CELL_H * HS);
+    let px = cw as f32 / 0.6;
+    let lm = font.horizontal_line_metrics(px).expect("line metrics");
+    let baseline = (ch as f32 - (lm.ascent - lm.descent)) * 0.5 + lm.ascent;
+    let width = FONT_COLS * FONT_CELL_W;
     let spread_hi = FONT_SPREAD * HS as f32;
     for (gi, c) in chars.iter().enumerate() {
         let (m, bmp) = font.rasterize(*c, px);
@@ -246,11 +328,6 @@ pub fn build_font(ttf: &[u8]) -> Image {
                     pack([v, v, v], 1.0);
             }
         }
-    }
-    Image {
-        width,
-        height,
-        data,
     }
 }
 
@@ -370,6 +447,28 @@ fn edt_1d(f: &[f64], d: &mut [f64], v: &mut [usize], z: &mut [f64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atlas_coarsens_past_the_old_ladder_and_respects_odd_caps() {
+        use crate::scan::{classify, Lang};
+        let text = "let number = 42;\n".repeat(1000);
+        let sources: Vec<_> = (0..100)
+            .map(|i| classify(format!("file{i}.rs"), &text, Lang::Rust))
+            .collect();
+        let mut layout = Layout::build(&sources, "fixture");
+        let overlay = Overlay::empty(sources.len());
+        let palette = crate::scene::syntax_palette();
+        let (img, texel) = build_minimap(&mut layout, &sources, &palette, &overlay, 63, 4).unwrap();
+        assert!(texel > 16.0);
+        assert!(img.width <= 63 && img.height <= 63);
+        assert_eq!(img.data.len(), img.width * img.height);
+        assert!(layout
+            .files
+            .iter()
+            .all(|f| f.uv[0] < f.uv[2] && f.uv[1] < f.uv[3] && f.uv[2] <= 1.0 && f.uv[3] <= 1.0));
+        assert!(build_minimap(&mut layout, &sources, &palette, &overlay, 16, 0).is_err());
+        assert!(parse_size(Some("0".into())).is_err());
+    }
 
     #[test]
     fn mip_levels_halve_and_average() {

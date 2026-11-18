@@ -10,6 +10,7 @@ script_mod! {
             main_window := Window{
                 window.title: "codescape"
                 window.inner_size: vec2(1920, 1080)
+                pass +: { clear_color: #x0A1128 }
                 // 2.0 draws a title strip on macOS by default; 1.0 ran the
                 // scene full-height under the traffic lights.
                 show_caption_bar: false

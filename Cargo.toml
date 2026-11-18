@@ -17,6 +17,7 @@ default-run = "codescape"
 # put the new sha here, rebuild, re-run the checks in README.
 makepad-widgets = { git = "https://github.com/makepad/makepad", rev = "88639f79a2365081285529f1d5138416be8fdd60", optional = true }
 fontdue = "0.9"
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 
 [features]
 default = ["gui"]

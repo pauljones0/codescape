@@ -1,6 +1,6 @@
-//! codescape: fly through a git repository's source in 3D.
+//! codescape: explore a Git repository as a map of its source.
 //!
-//! Usage: codescape [REPO] [--diff REV|RANGE] [--pr N] [--tour] [--loop]
+//! Usage: codescape [REPO] [--3d] [--diff REV|RANGE] [--pr N] [--tour] [--loop]
 //!                  [--trace ITF [--trace-rate N]] [--record DIR] [--record-fps N]
 //!                  [--atlas N]
 
@@ -9,6 +9,11 @@ mod scape;
 
 // Re-exported at the crate root so the renderer can keep saying `crate::`.
 pub use codescape::{atlas, camera, capture, diff, layout, overlay, scan, scene, tour, trace};
+
+fn fail(message: impl std::fmt::Display) -> ! {
+    eprintln!("codescape: {message}");
+    std::process::exit(2);
+}
 
 /// Why the Linux display is unusable, if it is. A Wayland compositor is enough
 /// for in-process recording; X is only checked when Wayland is unavailable.

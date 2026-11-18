@@ -8,7 +8,8 @@
 //! Usage: bench [REPO] [--repeat N] [--frames N] [--atlas N] [--width W] [--height H]
 
 use codescape::{
-    atlas, diff, layout::Layout, mem, overlay::Overlay, scan, scene, tour::Tour, trace::Trace,
+    atlas, camera::Camera, diff, layout::Layout, mem, overlay::Overlay, scan, scene, tour::Tour,
+    trace::Trace,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -23,13 +24,20 @@ fn main() {
     let (mut width, mut height) = (1920.0f32, 1080.0f32);
     let (mut diff_spec, mut trace_path): (Option<String>, Option<String>) = (None, None);
     let mut pr: Option<u32> = None;
+    let mut perspective = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         let mut next = |d: f64| args.next().and_then(|v| v.parse().ok()).unwrap_or(d);
         match a.as_str() {
+            "--3d" => perspective = true,
             "--repeat" => repeat = next(1.0) as usize,
             "--frames" => frames = next(600.0) as usize,
-            "--atlas" => atlas_size = next(8192.0) as usize,
+            "--atlas" => {
+                atlas_size = atlas::parse_size(args.next()).unwrap_or_else(|error| {
+                    eprintln!("bench: {error}");
+                    std::process::exit(2);
+                });
+            }
             "--diff" => diff_spec = args.next(),
             "--pr" => pr = args.next().and_then(|v| v.parse().ok()),
             "--trace" => trace_path = args.next(),
@@ -42,7 +50,10 @@ fn main() {
     let root = repo.unwrap_or_else(|| std::env::current_dir().unwrap());
 
     let t = Instant::now();
-    let mut sources = scan::scan_repo(&root);
+    let mut sources = scan::scan_repo(&root).unwrap_or_else(|error| {
+        eprintln!("bench: {error}");
+        std::process::exit(2);
+    });
     let scan_ms = t.elapsed().as_secs_f64() * 1e3;
     let scanned = sources.len();
 
@@ -82,7 +93,11 @@ fn main() {
                 Some(n) => diff::patch_for_pr(&root, n).expect("gh pr diff"),
                 None => diff::patch_for(&root, &spec).expect("git diff"),
             };
-            let (ov, dropped) = diff::overlay(&patch, &sources, spec.clone());
+            let (ov, dropped) = if pr.is_some() {
+                diff::pr_overlay(&root, &patch, &sources, spec.clone()).expect("PR checkout scope")
+            } else {
+                diff::overlay(&patch, &sources, spec.clone())
+            };
             let (a, r) = ov.totals();
             let marked: usize = ov
                 .files
@@ -109,7 +124,11 @@ fn main() {
     let palette = scene::syntax_palette();
     let t = Instant::now();
     let (minimap, texel) =
-        atlas::build_minimap(&mut layout, &sources, &palette, &overlay, atlas_size, 0);
+        atlas::build_minimap(&mut layout, &sources, &palette, &overlay, atlas_size, 0)
+            .unwrap_or_else(|error| {
+                eprintln!("bench: {error}");
+                std::process::exit(2);
+            });
     let atlas_ms = t.elapsed().as_secs_f64() * 1e3;
     let atlas_bytes = minimap.width * minimap.height * 4;
     let atlas_dims = (minimap.width, minimap.height);
@@ -141,7 +160,18 @@ fn main() {
 
     // Per-frame CPU: walk the tour and collect the glyph set for each frame.
     let paths: Vec<&str> = sources.iter().map(|s| s.path.as_str()).collect();
-    let mut tour = Tour::for_repo(&layout, &paths, true);
+    let mut tour = if perspective {
+        Tour::for_repo(&layout, &paths, true)
+    } else {
+        Tour::for_map(&layout, width, height, true)
+    };
+    let view_at = |cam: &Camera| {
+        if perspective {
+            cam.view(width, height)
+        } else {
+            cam.map_view(width, height)
+        }
+    };
     let n = layout.files.len();
     let mut sc = scene::Scene {
         sources,
@@ -151,6 +181,8 @@ fn main() {
         overlay,
         glyph_on: vec![false; n],
         glyph_count: 0,
+        visible_dirs: Vec::new(),
+        visible_files: Vec::new(),
     };
     if let Some(path) = &trace_path {
         let text = std::fs::read_to_string(root.join(path)).expect("trace file");
@@ -211,7 +243,7 @@ fn main() {
     let dt = 1.0 / 60.0;
     for _ in 0..frames {
         let Some(cam) = tour.advance(dt) else { break };
-        let view = cam.view(width, height);
+        let view = view_at(&cam);
         buf.clear();
         let t = Instant::now();
         scene::collect_glyphs(&mut sc, &view, &mut buf);
@@ -244,9 +276,36 @@ fn main() {
     );
     // The tour never parks at the altitude where the most files are still
     // readable, which is where the glyph set peaks. Sweep it directly.
-    let overview = scene::overview(&sc.layout);
-    let near = scene::reading_view(&sc.layout, 0, height);
-    let (mut worst_ms, mut worst_glyphs, mut worst_dist) = (0.0f64, 0usize, 0.0f32);
+    if sc.layout.files.is_empty() {
+        return;
+    }
+    let (overview, near) = if perspective {
+        (
+            scene::overview(&sc.layout),
+            scene::reading_view(&sc.layout, 0, height),
+        )
+    } else {
+        (
+            Camera::fit_map(sc.layout.dirs[0].rect, width, height),
+            scene::map_reading_view(&sc.layout, 0, width, height),
+        )
+    };
+    for (label, cam) in [("overview", overview), ("file reading", near)] {
+        let view = view_at(&cam);
+        let samples = 1000;
+        let t = Instant::now();
+        for _ in 0..samples {
+            buf.clear();
+            scene::collect_glyphs(&mut sc, &view, &mut buf);
+        }
+        println!(
+            "{label:16}{:.3} ms/frame, {} tiles, {} glyphs",
+            t.elapsed().as_secs_f64() * 1000.0 / samples as f64,
+            sc.visible_files.len(),
+            sc.glyph_count
+        );
+    }
+    let (mut densest, mut worst_glyphs) = (overview, 0usize);
     let steps = 240;
     for i in 0..=steps {
         let f = i as f32 / steps as f32;
@@ -258,22 +317,29 @@ fn main() {
             yaw: overview.yaw,
             pitch: overview.pitch,
         };
-        let view = cam.view(width, height);
+        let view = view_at(&cam);
         buf.clear();
-        let t = Instant::now();
         scene::collect_glyphs(&mut sc, &view, &mut buf);
-        let el = t.elapsed().as_secs_f64() * 1e3;
         if sc.glyph_count > worst_glyphs {
             worst_glyphs = sc.glyph_count;
-            worst_ms = el;
-            worst_dist = dist;
+            densest = cam;
         }
     }
+    // Compare the same dense view repeatedly. One timed frame is too sensitive
+    // to scheduler noise and to the glyph vector growing during the sweep.
+    let view = view_at(&densest);
+    let samples = 500;
+    let t = Instant::now();
+    for _ in 0..samples {
+        buf.clear();
+        scene::collect_glyphs(&mut sc, &view, &mut buf);
+    }
+    let worst_ms = t.elapsed().as_secs_f64() * 1000.0 / samples as f64;
     println!(
-        "worst frame     {} glyphs in {:.2} ms at camera distance {:.0}  ({:.0} MB instance data, {:.0} fps ceiling)",
+        "worst frame     {} glyphs in {:.3} ms at camera distance {:.0}  ({:.1} MB instance data, {:.0} fps ceiling)",
         worst_glyphs,
         worst_ms,
-        worst_dist,
+        densest.dist,
         mb(worst_glyphs * scene::GLYPH_SLOTS * 4),
         1000.0 / worst_ms.max(1e-6)
     );

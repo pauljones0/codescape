@@ -19,7 +19,7 @@ pub struct Tour {
     shots: Vec<Shot>,
     from: Camera,
     index: usize,
-    t: f32,
+    t: f64,
     looped: bool,
 }
 
@@ -56,6 +56,56 @@ fn file_view(l: &Layout, path: &str, sources_paths: &[&str]) -> Option<(Camera, 
 }
 
 impl Tour {
+    pub fn for_map(l: &Layout, width: f32, height: f32, looped: bool) -> Tour {
+        let home = Camera::fit_map(l.dirs[0].rect, width, height);
+        let mut dirs = l.dirs[0].dirs.clone();
+        dirs.sort_by_key(|&i| std::cmp::Reverse(l.dirs[i].lines));
+        let mut shots = vec![Shot {
+            cam: home,
+            travel: 0.0,
+            hold: 2.0,
+            drift: V3::default(),
+            yaw_drift: 0.0,
+            caption: None,
+        }];
+        for &i in dirs.iter().take(5) {
+            let dir = &l.dirs[i];
+            shots.push(Shot {
+                cam: Camera::fit_map(dir.rect, width, height),
+                travel: 1.5,
+                hold: 2.0,
+                drift: V3::default(),
+                yaw_drift: 0.0,
+                caption: Some(format!("{}/", dir.path)),
+            });
+        }
+        if let Some((i, f)) = l.files.iter().enumerate().max_by_key(|(_, f)| f.lines) {
+            shots.push(Shot {
+                cam: crate::scene::map_reading_view(l, i, width, height),
+                travel: 1.5,
+                hold: 3.0,
+                drift: V3::default(),
+                yaw_drift: 0.0,
+                caption: Some(f.name.clone()),
+            });
+        }
+        shots.push(Shot {
+            cam: home,
+            travel: 1.5,
+            hold: 1.0,
+            drift: V3::default(),
+            yaw_drift: 0.0,
+            caption: None,
+        });
+        Tour {
+            from: home,
+            shots,
+            index: 0,
+            t: 0.0,
+            looped,
+        }
+    }
+
     pub fn for_repo(l: &Layout, paths: &[&str], looped: bool) -> Tour {
         let home = overview(l);
         let mut shots = vec![Shot {
@@ -167,20 +217,21 @@ impl Tour {
     pub fn caption(&self) -> Option<&str> {
         let s = self.shots.get(self.index)?;
         // Show the caption once the camera is most of the way there.
-        (self.t > s.travel * 0.55)
+        (self.t > f64::from(s.travel) * 0.55)
             .then_some(s.caption.as_deref())
             .flatten()
     }
 
     /// Advances by `dt` seconds; returns the camera, or None when finished.
     pub fn advance(&mut self, dt: f64) -> Option<Camera> {
-        self.t += dt as f32;
+        self.t += dt;
         loop {
             let s = self.shots.get(self.index)?;
-            if self.t < s.travel + s.hold {
+            let duration = f64::from(s.travel) + f64::from(s.hold);
+            if self.t < duration {
                 break;
             }
-            self.t -= s.travel + s.hold;
+            self.t -= duration;
             self.from = held(s, s.hold);
             self.index += 1;
             if self.index == self.shots.len() {
@@ -189,11 +240,19 @@ impl Tour {
                 }
                 self.index = 0;
                 self.shots[0].travel = 4.0;
+                // A screenshot can seek arbitrarily far into a looping tour.
+                let cycle = self
+                    .shots
+                    .iter()
+                    .map(|s| f64::from(s.travel) + f64::from(s.hold))
+                    .sum::<f64>();
+                self.t %= cycle;
             }
         }
         let s = &self.shots[self.index];
-        if self.t < s.travel {
-            let u = self.t / s.travel;
+        let travel = f64::from(s.travel);
+        if self.t < travel {
+            let u = (self.t / travel) as f32;
             let e = u * u * (3.0 - 2.0 * u);
             let mut c = self.from.lerp(&s.cam, e);
             // Rise on long hops so the flight reads as a flight.
@@ -203,7 +262,7 @@ impl Tour {
             c.dist *= (lift * (std::f32::consts::PI * e).sin()).exp();
             Some(c)
         } else {
-            Some(held(s, self.t - s.travel))
+            Some(held(s, (self.t - travel) as f32))
         }
     }
 }
@@ -213,4 +272,37 @@ fn held(s: &Shot, t: f32) -> Camera {
     c.target = c.target.add(s.drift.scale(t));
     c.yaw += s.yaw_drift * t;
     c
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn looping_tour_skips_complete_cycles_when_seeking() {
+        let home = Camera {
+            target: V3::default(),
+            dist: 1.0,
+            yaw: 0.0,
+            pitch: 0.0,
+        };
+        let mut tour = Tour {
+            shots: vec![Shot {
+                cam: home,
+                travel: 0.0,
+                hold: 2.0,
+                drift: V3::default(),
+                yaw_drift: 0.0,
+                caption: None,
+            }],
+            from: home,
+            index: 0,
+            t: 0.0,
+            looped: true,
+        };
+        assert!(tour.advance(6.0 * 1_000_000_000.0 + 3.25).is_some());
+        assert_eq!(tour.t, 1.25);
+        assert!(tour.advance(1e300).is_some());
+        assert!((0.0..6.0).contains(&tour.t));
+    }
 }

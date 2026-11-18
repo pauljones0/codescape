@@ -1,27 +1,22 @@
 # codescape
 
-A 3D map of a Git repository's source that you can fly through, built on
+A top-down map of a Git repository's source that you can pan and zoom, built on
 [Makepad](https://github.com/makepad/makepad). It is inspired by Rik Arends'
 Makepad source visualizer.
 
-![Overview of the flop-core repository](docs/overview.jpg)
-
-Each directory is a raised block, and nested directories stack on top of their
-parent. Each file is a flat tile holding its real text, split into columns so
-the tile stays roughly square. Blocks take an accent colour from their
-top-level directory; larger directories get cyan, green and blue first.
+Directories contain their children, and each file is a tile holding its real
+text, split into columns. Directories take an accent colour from their top-level
+directory. Use `--3d` for the original perspective view.
 
 It uses two levels of detail:
 
-- **Far:** every file is one quad. It samples a mipmapped minimap atlas where
-  each texel covers two characters of one line, coloured by syntax class.
-  The whole repo (about 4.6k files and 1M lines) costs about 4.6k quads.
+- **Far:** each visible file is one quad sampled from a mipmapped,
+  syntax-coloured minimap atlas.
 - **Near:** files that appear large on screen also get one quad per
-  character, drawn from a signed-distance-field font atlas. Nearest files come
-  first, up to 450k glyphs, and the text stays sharp at any zoom.
+  visible character, drawn from a signed-distance-field font atlas.
 
-A scan and layout of the example flop-core repository takes about 0.6 s. All text is uploaded once;
-the camera changes only uniforms and the near-glyph set.
+The top-down view skips off-screen directory subtrees and only visits the text
+rows and columns that intersect the viewport. The minimap uploads at load time.
 
 ## Build
 
@@ -114,13 +109,10 @@ built on the CPU during decode and costs about a third more texture memory.
 The minimap is not a decoded image — it is rasterised here and uploaded as an
 explicit mip texture — so it is unaffected by that default either way.
 
-The window backends differ on depth: X11 asks EGL for none, while Metal has a
-real buffer and Makepad's 2D draws write into it. The landscape does not rely
-on either one. `CodeScape` renders its boxes, tiles and glyphs into a child
-`DrawPass` with its own `DepthD32` texture, then composites the colour texture
-into the UI. The HUD draws last in that pass at normal 2D depth. Depth testing
-and the ordinary projection therefore behave the same on Metal, X11 and
-Wayland, while captures retain the complete frame.
+The top-down map draws parents before children. Interactive Vulkan windows can
+draw it straight into the window when the map fills the viewport. Captures and
+other backends use a child pass, which also supplies `--3d` with a dedicated
+`DepthD32` texture. The HUD draws last in both modes.
 
 The renderer-free core cross-checks for macOS without an SDK, which is the
 cheapest guard against breaking it:
@@ -139,33 +131,41 @@ compiles Objective-C and needs the real macOS SDK.
 cargo run --locked --release -- /path/to/repo # any git checkout
 cargo run --locked --release                 # repo containing the current directory
 cargo run --locked --release -- /path/to/repo --tour --loop
+cargo run --locked --release -- /path/to/repo --3d
 ```
 
 | Input | Action |
 |-------|--------|
 | drag | pan |
-| right-drag / shift-drag | orbit |
+| right-drag / shift-drag | orbit in `--3d` |
 | wheel | zoom toward the cursor |
 | click a file | fly in to reading distance |
 | `W` `A` `S` `D` / arrows | move |
-| `Q` / `E` | rotate |
-| `R` / `F` | tilt |
+| `Q` / `E` | rotate in `--3d` |
+| `R` / `F` | tilt in `--3d` |
 | `Z` / `X` | zoom in / out |
-| `T` | tour |
-| `H` | overview |
+| `T` | start the repository tour |
+| `H` | fit the whole repository |
 | space | play / pause a trace |
 | `,` `.` | step a trace back / forward |
 
+The top-down tour visits the largest directories and zooms into a file.
 The scan covers tracked source, docs and config (`git ls-files`). It skips
 lockfiles, bundles, minified files, files over 20k lines, and files whose
 average line is over 240 characters.
 
+`--atlas N` sets the maximum width and height of the minimap in pixels. The
+default is 8192. Codescape uses coarser tiles as needed and exits with an error
+if the minimum tile sizes cannot fit.
+
 ## Recording
 
-`--record DIR` runs the tour at a fixed step (`--record-fps`, default 30). It
-saves one PNG read directly from the offscreen scene pass per frame and exits
-when the tour ends, so the video stays smooth however fast the machine renders.
+`--record DIR` runs one pass of the tour at a fixed step (`--record-fps`, default
+30), including when `--loop` is supplied. It saves one PNG from the offscreen
+scene pass per frame and exits when the tour ends. Captures follow the scripted
+camera.
 `--at SECONDS --shot FILE` saves a single frame from that point in the tour.
+The timestamp must be finite and nonnegative.
 The readback runs in-process: neither mode invokes `xwd` or `screencapture`,
 needs Screen Recording permission, or depends on the display being awake and
 unlocked. On Linux capture selects Makepad's OpenGL renderer at startup because
@@ -193,6 +193,11 @@ Added lines are green, lines that replaced something are amber, and the line
 that closed a pure deletion is red. File tiles take the same colours, with the
 rim brightening with churn, so a 600-line rewrite is louder than a typo. The
 inspector lists the busiest files and any file deleted outright.
+
+For renames, the inspector shows both paths. In a checkout with the old path
+still present, the old tile carries the rename and churn counts, and head-line
+marks are omitted until the renamed file is present. Diff paths follow the
+selected scan directory, including when it starts inside a checkout.
 
 `--diff <rev>` compares a revision against the **working tree**, which is
 exactly what the map renders, so line numbers always agree. `--diff a..b` and
@@ -252,8 +257,9 @@ quint run formal-specs/channel/channel-payout-liveness.qnt \
 
 With `--trace`, `--record DIR` records the trace instead of the tour: it
 plays the trace once at `--trace-rate`, holds the last state for 1.5 s and
-exits. 600 steps at 60 a second make an 11.5 s video (frames are PNG on
-every backend):
+exits. A one-state trace records the final hold. An unreadable, invalid, or
+unbound trace exits with an error before the first frame. 600 steps at 60 a
+second make an 11.5 s video (frames are PNG on every backend):
 
 ```sh
 /path/to/codescape/target/release/codescape . --trace /tmp/long.itf.json --trace-rate 60 --record /tmp/frames
@@ -272,14 +278,19 @@ opening a window, and reports what the renderer would be holding. It takes the
 same `--diff` and `--trace` flags, which is how those paths are exercised
 without a GPU.
 
+The [top-down reliability postmortem](docs/top-down-postmortem.md) includes
+before-and-after benchmarks on `drost-community`.
+
 ```sh
 cargo run --release --no-default-features --bin bench -- . --frames 12000
+cargo run --release --no-default-features --bin bench -- . --3d
 cargo run --release --no-default-features --bin bench -- . --repeat 8   # synthetic 8x repo
 cargo run --release --no-default-features --bin bench -- . --pr 1698    # check the diff path
 cargo run --release --no-default-features --bin bench -- . --trace path/to.itf.json
 ```
 
-On a DGX Spark (GB10, 20-core Grace, aarch64), scanning flop-core and eight
+The original perspective renderer was benchmarked on a DGX Spark
+(GB10, 20-core Grace, aarch64), scanning flop-core and eight
 synthetic copies of it:
 
 | repo | files | lines | load | minimap atlas | text resident | worst frame | RSS |
@@ -289,11 +300,9 @@ synthetic copies of it:
 | 4x | 18,392 | 4.17M | 0.56 s | 8192x7424, texel 4 — 232 MB | 331 MB | 87k glyphs, 0.29 ms | 643 MB |
 | 8x | 36,784 | 8.33M | 0.60 s | 8192x6784, texel 6 — 212 MB | 662 MB | 205k glyphs, 0.85 ms | 970 MB |
 
-Two properties matter and both hold. Texture memory is **constant**: the packer
-picks the finest texel from a ladder that still fits one 8192-square atlas, so
-eight times the source costs the same 200-odd MB and reads coarser rather than
-larger. And the glyph set is bounded by **screen area**, not by repo size: a
-line must clear 3 px to get real glyphs, which confines them to a disc about
+Texture memory has an upper bound. The packer chooses the finest texel size
+that fits the configured atlas dimensions. The glyph set is bounded by
+**screen area**. A line must clear 3 px to get real glyphs, which confines them to a disc about
 770 world units across whatever the repo contains. Resident memory grows only
 with the source text itself, at roughly 80 bytes per line.
 

@@ -28,6 +28,13 @@ impl Rect {
     pub fn center(&self) -> (f32, f32) {
         (self.x + self.w * 0.5, self.z + self.h * 0.5)
     }
+
+    pub fn intersects(&self, other: &Self) -> bool {
+        self.x <= other.x + other.w
+            && self.x + self.w >= other.x
+            && self.z <= other.z + other.h
+            && self.z + self.h >= other.z
+    }
 }
 
 pub struct FileNode {
@@ -44,6 +51,15 @@ pub struct FileNode {
 }
 
 impl FileNode {
+    pub fn label_rect(&self) -> Rect {
+        Rect {
+            x: self.tile.x,
+            z: self.tile.z - FILE_LABEL_H - 2.0,
+            w: FILE_LABEL_H * 0.5 * self.name.len() as f32,
+            h: FILE_LABEL_H,
+        }
+    }
+
     /// World position (x, z) of the start of `line`.
     pub fn char_pos(&self, line: usize) -> (f32, f32) {
         let col = line / self.lines_per_col;
@@ -76,7 +92,79 @@ pub struct Layout {
     pub total_lines: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_culls_other_subtrees_and_keeps_label_only_hits() {
+        let files = ["a/src/main.rs", "b/lib.py"].map(|path| SourceFile {
+            path: path.into(),
+            text: vec![b'x'],
+            class: vec![0],
+            line_starts: vec![0],
+        });
+        let layout = Layout::build(&files, "repo");
+        let label = layout.files[0].label_rect();
+        let (x, z) = label.center();
+        let viewport = Rect {
+            x,
+            z,
+            w: 1.0,
+            h: 1.0,
+        };
+        let (mut dirs, mut tiles) = (Vec::new(), Vec::new());
+        layout.visible_nodes(&viewport, &mut dirs, &mut tiles);
+        assert_eq!(
+            dirs.iter()
+                .map(|&i| layout.dirs[i].path.as_str())
+                .collect::<Vec<_>>(),
+            ["", "a", "a/src"]
+        );
+        assert_eq!(tiles, [0]);
+        assert_eq!(layout.file_at(x, z), Some(0));
+        assert_eq!(layout.file_at(-2.0, -2.0), None);
+    }
+}
+
 impl Layout {
+    /// Collect visible nodes in paint order, pruning entire off-screen subtrees.
+    pub fn visible_nodes(&self, region: &Rect, dirs: &mut Vec<usize>, files: &mut Vec<usize>) {
+        self.visit_visible(0, region, dirs, files);
+    }
+
+    fn visit_visible(
+        &self,
+        d: usize,
+        region: &Rect,
+        dirs: &mut Vec<usize>,
+        files: &mut Vec<usize>,
+    ) {
+        let dir = &self.dirs[d];
+        if !region.intersects(&dir.rect) {
+            return;
+        }
+        dirs.push(d);
+        files.extend(dir.files.iter().copied().filter(|&i| {
+            let f = &self.files[i];
+            region.intersects(&f.tile) || region.intersects(&f.label_rect())
+        }));
+        for &child in &dir.dirs {
+            self.visit_visible(child, region, dirs, files);
+        }
+    }
+
+    pub fn file_at(&self, x: f32, z: f32) -> Option<usize> {
+        let mut d = &self.dirs[0];
+        while let Some(&child) = d.dirs.iter().find(|&&i| self.dirs[i].rect.contains(x, z)) {
+            d = &self.dirs[child];
+        }
+        d.files.iter().copied().find(|&i| {
+            let f = &self.files[i];
+            f.tile.contains(x, z) || f.label_rect().contains(x, z)
+        })
+    }
+
     pub fn build(sources: &[SourceFile], repo_name: &str) -> Layout {
         let mut l = Layout {
             dirs: Vec::new(),
